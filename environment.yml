@@ -1,0 +1,11 @@
+# Binder environment for the AutoUQ workshop notebook. Contains no LM code — only the dependency list.
+name: autouq-workshop
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy
+  - scipy
+  - scikit-learn
+  - plotly>=6
+  - ipykernel
