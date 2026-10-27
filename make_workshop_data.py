@@ -1,4 +1,7 @@
-"""Generate the workshop's CSV files: a 24-run Latin hypercube DOE extended by 168 Bayesian-optimization infill runs, and a dense reference sweep.
+"""Generate the workshop's CSV files: a 24-run Latin hypercube DOE extended by 48 Bayesian-optimization infill runs, and a dense reference sweep.
+
+The infill alternates two exploitation steps (upper confidence bound, small kappa) with one exploration step (largest epistemic std), and never
+places a run closer than a minimum spacing to an existing one, so the log shows the exploitation/exploration trade-off rather than a pile-up on the ridge.
 
 The synthetic aerodynamics live here, not in the notebook. Re-running this script reproduces the files exactly.
 """
@@ -69,12 +72,25 @@ class Aero(float, ReprEnum):
     BUFFET_MACH = 0.84
 
 
+class Infill(float, ReprEnum):
+    """Acquisition settings for the infill.
+
+    Attributes:
+        KAPPA: Exploration weight of the UCB used on exploitation steps.
+        SPACING: Minimum distance between runs in the unit design box.
+    """
+
+    KAPPA = 1.0
+    SPACING = 0.04
+
+
 class Sizes(IntEnum):
     """Sample sizes and seeds.
 
     Attributes:
         GRID: Points per axis of the reference sweep.
         LHS: Runs in the initial Latin hypercube.
+        EXPLORE_EVERY: Every n-th infill step explores instead of exploiting.
         POOL: Total runs in the DOE file (LHS plus BO infill).
         POOL_SEED: Seed of the LHS and the run noise.
         REF_SEED: Seed of the reference sweep's noisy realisation.
@@ -82,7 +98,8 @@ class Sizes(IntEnum):
 
     GRID = 60
     LHS = 24
-    POOL = 192
+    EXPLORE_EVERY = 3
+    POOL = 72
     POOL_SEED = 3
     REF_SEED = 99
 
@@ -178,31 +195,43 @@ def build_pipeline(seed: int = 0) -> Pipeline:
     return Pipeline([("scaler", StandardScaler()), ("reducer", PCA(n_components=2)), ("estimator", gp)])
 
 
-def upper_confidence_bound(pipe: Pipeline, candidates: pd.DataFrame, kappa: float = 2.5) -> FloatArray:
-    """UCB on the epistemic std: mean + kappa * std.
+def epistemic(pipe: Pipeline, candidates: pd.DataFrame) -> tuple[FloatArray, FloatArray]:
+    """Predicted mean and epistemic std (total std with the fitted noise level removed).
 
     Args:
         pipe: Fitted pipeline.
         candidates: Candidate features.
-        kappa: Exploration weight.
 
     Returns:
-        Score per candidate.
+        Mean and epistemic std per candidate.
     """
     mean, std_total = pipe.predict(candidates, return_std=True)
     gp = pipe[-1]
     std = np.sqrt(np.clip(std_total ** 2 - float(gp.kernel_.k2.noise_level) * float(gp._y_train_std ** 2), 1e-12, None))
-    return mean + kappa * std
+    return mean, std
+
+
+def unit_box(mach: FloatArray, aoa: FloatArray) -> FloatArray:
+    """Map (M, α) into the unit square.
+
+    Args:
+        mach: Mach numbers.
+        aoa: Angles of attack in degrees.
+
+    Returns:
+        (n, 2) array in [0, 1]².
+    """
+    return np.column_stack([(mach - Aero.MACH_MIN) / (Aero.MACH_MAX - Aero.MACH_MIN), (aoa - Aero.AOA_MIN) / (Aero.AOA_MAX - Aero.AOA_MIN)])
 
 
 def make_runs(reference: pd.DataFrame) -> pd.DataFrame:
-    """The DOE: a 24-run Latin hypercube, then UCB-driven infill picked from the reference grid (no condition run twice), with noisy L/D.
+    """The DOE: a 24-run Latin hypercube, then infill picked from the reference grid alternating exploitation and exploration, with noisy L/D.
 
     Args:
         reference: The reference sweep (candidate conditions for the infill).
 
     Returns:
-        192-row run log with run_id, phase and lift_to_drag columns.
+        192-row run log with run_id, phase (lhs / exploit / explore) and lift_to_drag columns.
     """
     rng = np.random.default_rng(int(Sizes.POOL_SEED))
     unit = qmc.LatinHypercube(d=2, seed=int(Sizes.POOL_SEED)).random(int(Sizes.LHS))
@@ -211,17 +240,18 @@ def make_runs(reference: pd.DataFrame) -> pd.DataFrame:
     y = lift_to_drag(mach, aoa) + rng.normal(size=mach.size) * noise_sigma(mach, aoa)
     phase = ["lhs"] * mach.size
     candidates = reference[COLUMNS]
-    visited = np.zeros(len(reference), dtype=bool)
+    grid = unit_box(reference["mach"].to_numpy(), reference["aoa"].to_numpy())
     for step in range(int(Sizes.POOL) - int(Sizes.LHS)):
-        frame = run_log(mach, aoa)
-        pipe = build_pipeline(seed=step).fit(frame, y)
-        score = upper_confidence_bound(pipe, candidates)
-        score[visited] = -np.inf
+        pipe = build_pipeline(seed=step).fit(run_log(mach, aoa), y)
+        mean, std = epistemic(pipe, candidates)
+        explore = step % int(Sizes.EXPLORE_EVERY) == int(Sizes.EXPLORE_EVERY) - 1
+        score = std if explore else mean + Infill.KAPPA * std
+        gap = np.min(np.linalg.norm(grid[:, None, :] - unit_box(mach, aoa)[None, :, :], axis=2), axis=1)
+        score = np.where(gap < Infill.SPACING, -np.inf, score)
         nxt = int(np.argmax(score))
-        visited[nxt] = True
         mach, aoa = np.append(mach, reference["mach"][nxt]), np.append(aoa, reference["aoa"][nxt])
         y = np.append(y, reference["ld_true"][nxt] + rng.normal() * reference["noise_sigma"][nxt])
-        phase.append("infill")
+        phase.append("explore" if explore else "exploit")
     frame = run_log(mach, aoa)
     frame.insert(0, "run_id", np.arange(1, mach.size + 1))
     frame.insert(1, "phase", phase)
