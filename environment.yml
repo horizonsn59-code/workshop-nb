@@ -1,10 +1,11 @@
-# Binder environment for the AutoUQ workshop notebook. Contains no LM code — only the dependency list.
-name: autouq-workshop
+# Binder environment for the surrogate-modeling workshop notebook. Contains no LM code — only the dependency list.
+name: surrogate-workshop
 channels:
   - conda-forge
 dependencies:
   - python=3.12
   - numpy
+  - pandas
   - scipy
   - scikit-learn
   - plotly>=6
