@@ -1,15 +1,19 @@
+
+
 """Plumbing for the surrogate-modeling workshop notebook.
 
-Constants, data loading and Plotly rendering live here so the notebook only
-shows the parts that are being taught. Keep this file next to ``workshop.ipynb``
-with the CSVs in a ``data/`` folder beside it, both in ``docs/source/`` and in
-the repository the live (Thebe) kernel starts from.
+Constants, data loading, the reference-sweep answer key and Plotly rendering
+live here so the notebook only shows the parts that are being taught. Keep this
+file next to ``workshop.ipynb`` with the CSVs in a ``data/`` folder beside it,
+both in ``docs/source/`` and in the repository the live (Thebe) kernel starts from.
 """
 
 import uuid
 import warnings
+from dataclasses import dataclass
 from enum import IntEnum, ReprEnum, StrEnum
 from pathlib import Path
+from typing import Self
 
 import numpy as np
 import pandas as pd
@@ -17,19 +21,24 @@ import plotly.graph_objects as go
 from IPython.display import HTML, display
 from numpy.typing import NDArray
 from plotly.offline import get_plotlyjs
+from plotly.subplots import make_subplots
+from scipy.interpolate import RegularGridInterpolator
 from sklearn.exceptions import ConvergenceWarning
 
 __all__ = [
     "FEATURES",
-    "TRAIN_SIZES",
-    "Acquisition",
     "Aero",
     "Files",
     "FloatArray",
+    "ReferenceSweep",
     "Sizes",
     "Trace",
     "animate",
+    "field",
+    "fields_figure",
     "load",
+    "nearest_run",
+    "points",
     "show",
 ]
 
@@ -78,38 +87,19 @@ class Sizes(IntEnum):
 
     Attributes:
         GRID: Points per axis of the reference sweep.
-        LHS: Runs in the initial Latin hypercube (the first rows of the DOE).
-        DEMO: DOE rows used for the single-surrogate figures and exercises.
-        BO_INIT: BO initial design size (the Latin hypercube).
-        BO_ITER: BO acquisition steps.
-        BO_SEED: Observation-noise seed of the BO run.
+        LHS: Runs in the initial Latin hypercube (the first rows of cfd_runs.csv).
+        INFILL: CFD runs added by the infill loop.
+        SEED: Observation-noise seed of the infill run shown in the slider.
         HEIGHT: Figure height in pixels.
     """
 
     GRID = 60
     LHS = 24
-    DEMO = 72
-    BO_INIT = 24
-    BO_ITER = 16
-    BO_SEED = 5
+    INFILL = 16
+    SEED = 5
     HEIGHT = 480
 
 
-class Acquisition(StrEnum):
-    """Acquisition rules for run_bo.
-
-    Attributes:
-        EI: Expected improvement.
-        PI: Probability of improvement.
-        UCB: Upper confidence bound.
-    """
-
-    EI = "EI"
-    PI = "PI"
-    UCB = "UCB"
-
-
-TRAIN_SIZES = (24, 36, 48, 72)
 FEATURES = ["mach", "aoa", "v_inf", "q_inf", "reynolds"]
 DATA_DIRS = (Path(__file__).resolve().parent / "data", Path("data"), Path("../data"))
 _PLOTLY_JS_EMITTED = [False]
@@ -135,6 +125,108 @@ def load(name: Files) -> pd.DataFrame:
             return pd.read_csv(path)
     searched = ", ".join(str(folder) for folder in DATA_DIRS)
     raise FileNotFoundError(f"{name} not found in: {searched}")
+
+
+@dataclass(frozen=True)
+class ReferenceSweep:
+    """The dense Mach × AoA reference sweep: the answer key, used only for grading.
+
+    Rows are ordered angle-of-attack-major (AoA outer, Mach inner), so any
+    per-point array reshapes to (n_aoa, n_mach).
+
+    Attributes:
+        mach_axis: Distinct Mach values (heatmap x axis).
+        aoa_axis: Distinct angles of attack (heatmap y axis).
+        mach: Mach number of every grid point.
+        aoa: Angle of attack of every grid point.
+        X: The five run-log columns at every grid point.
+        y_true: Noise-free L/D.
+        sigma: Solver noise standard deviation.
+        y_cfd: One noisy CFD result per point.
+    """
+
+    mach_axis: FloatArray
+    aoa_axis: FloatArray
+    mach: FloatArray
+    aoa: FloatArray
+    X: FloatArray
+    y_true: FloatArray
+    sigma: FloatArray
+    y_cfd: FloatArray
+
+    @classmethod
+    def from_frame(cls, ref: pd.DataFrame) -> Self:
+        """Build from the cfd_reference.csv table.
+
+        Args:
+            ref: The reference table.
+
+        Returns:
+            The sweep.
+        """
+        return cls(
+            mach_axis=np.unique(ref["mach"]),
+            aoa_axis=np.unique(ref["aoa"]),
+            mach=ref["mach"].to_numpy(),
+            aoa=ref["aoa"].to_numpy(),
+            X=ref[FEATURES].to_numpy(),
+            y_true=ref["ld_true"].to_numpy(),
+            sigma=ref["noise_sigma"].to_numpy(),
+            y_cfd=ref["ld_cfd"].to_numpy(),
+        )
+
+    def grid(self, z: FloatArray) -> FloatArray:
+        """Reshape a per-point array to (n_aoa, n_mach).
+
+        Args:
+            z: One value per grid point.
+
+        Returns:
+            The values as a 2-D grid.
+        """
+        return z.reshape(self.aoa_axis.size, self.mach_axis.size)
+
+    def true_ld(self, mach: FloatArray, aoa: FloatArray) -> FloatArray:
+        """Noise-free L/D at arbitrary conditions, interpolated from the sweep.
+
+        Args:
+            mach: Mach numbers.
+            aoa: Angles of attack in degrees.
+
+        Returns:
+            Lift-to-drag ratio.
+        """
+        interp = RegularGridInterpolator((self.aoa_axis, self.mach_axis), self.grid(self.y_true))
+        return interp(np.column_stack([aoa, mach]))
+
+    def cfd_run(self, index: NDArray[np.int64], rng: np.random.Generator) -> FloatArray:
+        """Stand-in for launching CFD jobs at grid points: the true value plus the solver's noise.
+
+        Args:
+            index: Grid indices to run.
+            rng: Noise generator.
+
+        Returns:
+            Noisy L/D per run.
+        """
+        return self.y_true[index] + rng.normal(size=np.size(index)) * self.sigma[index]
+
+
+def nearest_run(mach: FloatArray, aoa: FloatArray, run_mach: FloatArray, run_aoa: FloatArray) -> FloatArray:
+    """Distance from each condition to the closest run, in design-box widths.
+
+    Args:
+        mach: Mach numbers of the conditions.
+        aoa: Angles of attack of the conditions.
+        run_mach: Mach numbers of the runs.
+        run_aoa: Angles of attack of the runs.
+
+    Returns:
+        Distance per condition (1 = the full width of the box).
+    """
+    dm = (mach[:, None] - run_mach[None, :]) / (Aero.MACH_MAX - Aero.MACH_MIN)
+    da = (aoa[:, None] - run_aoa[None, :]) / (Aero.AOA_MAX - Aero.AOA_MIN)
+    return np.sqrt(dm**2 + da**2).min(axis=1)
 
 
 def show(fig: go.Figure, title: str, subtitle: str = "") -> None:
@@ -198,3 +290,99 @@ def animate(
         fig.update_layout(
             sliders=[{"steps": entries, "currentvalue": {"prefix": prefix}, "pad": {"t": 110}, "x": 0.02, "len": 0.96}]
         )
+
+
+def fields_figure(titles: tuple[str, ...]) -> go.Figure:
+    """Empty 1×k subplot figure with Mach / AoA axes.
+
+    Args:
+        titles: One subplot title per column.
+
+    Returns:
+        Figure ready for field and points traces.
+    """
+    fig = make_subplots(rows=1, cols=len(titles), subplot_titles=titles, horizontal_spacing=0.36 / len(titles))
+    fig.update_xaxes(title_text="Mach")
+    fig.update_yaxes(title_text="angle of attack [deg]", col=1)
+    fig.update_layout(height=Sizes.HEIGHT, legend={"orientation": "h", "y": -0.15, "x": 0})
+    return fig
+
+
+def field(
+    fig: go.Figure,
+    sweep: ReferenceSweep,
+    z: FloatArray,
+    col: int,
+    colorscale: str,
+    zrange: tuple[float, float] | None = None,
+    name: str = "",
+) -> go.Heatmap:
+    """Design-space heatmap of per-grid-point values for subplot column col.
+
+    Args:
+        fig: Figure the trace will live in (used to place the colour bar).
+        sweep: Grid the values live on.
+        z: One value per grid point.
+        col: 1-based subplot column.
+        colorscale: Plotly colour scale.
+        zrange: Fixed colour range.
+        name: Colour-bar title.
+
+    Returns:
+        Heatmap trace bound to that column's axes.
+    """
+    suffix = "" if col == 1 else str(col)
+    zmin, zmax = zrange if zrange else (None, None)
+    colorbar = {"title": name, "len": 0.8, "thickness": 14, "x": fig.layout[f"xaxis{suffix}"].domain[1] + 0.012}
+    return go.Heatmap(
+        x=sweep.mach_axis,
+        y=sweep.aoa_axis,
+        z=sweep.grid(z),
+        colorscale=colorscale,
+        zmin=zmin,
+        zmax=zmax,
+        zsmooth="best",
+        xaxis=f"x{suffix}",
+        yaxis=f"y{suffix}",
+        colorbar=colorbar,
+        hovertemplate="Mach %{x:.2f}<br>AoA %{y:.1f}°<br>%{z:.2f}<extra></extra>",
+    )
+
+
+def points(
+    mach: FloatArray,
+    aoa: FloatArray,
+    col: int,
+    name: str = "CFD runs",
+    color: str = "#d1495b",
+    size: int = 7,
+    symbol: str = "circle",
+    outline: str = "white",
+) -> go.Scatter:
+    """Markers for subplot column col.
+
+    Args:
+        mach: Mach numbers.
+        aoa: Angles of attack.
+        col: 1-based subplot column.
+        name: Legend name.
+        color: Marker colour.
+        size: Marker size.
+        symbol: Marker symbol.
+        outline: Marker outline colour.
+
+    Returns:
+        Scatter trace bound to that column's axes.
+    """
+    suffix = "" if col == 1 else str(col)
+    return go.Scatter(
+        x=mach,
+        y=aoa,
+        mode="markers",
+        name=name,
+        xaxis=f"x{suffix}",
+        yaxis=f"y{suffix}",
+        showlegend=col == 1,
+        marker={"color": color, "size": size, "symbol": symbol, "line": {"color": outline, "width": 1.5}},
+        hovertemplate="Mach %{x:.2f}<br>AoA %{y:.1f}°<extra></extra>",
+    )
