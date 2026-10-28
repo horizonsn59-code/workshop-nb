@@ -1,6 +1,3 @@
-# Copyright 2026 Lockheed Martin Corporation
-# Lockheed Martin Proprietary Information
-
 """Plumbing for the surrogate-modeling workshop notebook.
 
 Constants, data loading and Plotly rendering live here so the notebook only
